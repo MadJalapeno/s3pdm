@@ -2,12 +2,14 @@
 s3vault_core - storage logic for S3 Vault (no GUI code here).
 
 Bucket layout (under an optional prefix):
-    blobs/<sha256>            file contents, content-addressed (identical files stored once)
-    commits/<commit-id>.json  one record per check-in: time, user, comment, files + versions
-    index/<rel/path>.json     per-file version history
+    blobs/<sha256>                  file contents, content-addressed (identical files stored once)
+    commits/<commit-id>.json        one record per action: check-in, rename or untrack
+    index/<rel/path>.json           version history of each tracked file
+    current/<rel/path>              latest version of each tracked file under its real name
+    archive/<rel/path>.<id>.json    history of files that were untracked (kept, never deleted)
 
 Versioning is done by the app itself, so the bucket does NOT need S3 object
-versioning (Garage, for example, doesn't support it).
+versioning. A local cache of the history means a refresh only downloads what changed.
 """
 from __future__ import annotations
 
@@ -35,16 +37,17 @@ else:                                              # Linux
     CONFIG_DIR = Path.home() / ".config" / "S3Vault"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HASH_CACHE_FILE = CONFIG_DIR / "hashcache.json"
+HISTORY_DIR = CONFIG_DIR / "history"
+ERROR_LOG = CONFIG_DIR / "error.log"
 
-# SOLIDWORKS / Office lock files and our own temp files are never checked in.
+# Lock files, Explorer clutter and our own temp files are never checked in.
 IGNORED_NAME_PREFIXES = ("~$", ".~")
 IGNORED_SUFFIXES = (".s3vault-tmp",)
-IGNORED_NAMES = {"thumbs.db", "desktop.ini"}  # Windows Explorer clutter
-ERROR_LOG = CONFIG_DIR / "error.log"
+IGNORED_NAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
 
 DEFAULT_CONFIG = {
     "endpoint_url": "",
-    "region": "garage",
+    "region": "",
     "bucket": "",
     "prefix": "",
     "access_key": "",
@@ -74,6 +77,13 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), "utf-8")
 
 
+def _atomic_write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), "utf-8")
+    os.replace(tmp, path)
+
+
 def is_ignored(name: str) -> bool:
     return (name.startswith(IGNORED_NAME_PREFIXES) or name.endswith(IGNORED_SUFFIXES)
             or name.lower() in IGNORED_NAMES)
@@ -91,6 +101,10 @@ def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def new_commit_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:6]
+
+
 def local_time(iso: str) -> str:
     try:
         dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -100,7 +114,9 @@ def local_time(iso: str) -> str:
 
 
 def human_size(n) -> str:
-    n = float(n or 0)
+    if n is None:
+        return ""
+    n = float(n)
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
@@ -138,13 +154,31 @@ class HashCache:
 
     def save(self) -> None:
         with self.lock:
-            if not self.dirty:
-                return
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data), "utf-8")
-            os.replace(tmp, self.path)
-            self.dirty = False
+            if self.dirty:
+                _atomic_write_json(self.path, self.data)
+                self.dirty = False
+
+
+class HistoryCache:
+    """Local copy of the bucket's index and commit records, one file per vault."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            d = json.loads(path.read_text("utf-8"))
+        except (FileNotFoundError, ValueError):
+            d = {}
+        self.indexes = d.get("indexes", {})
+        self.etags = d.get("etags", {})
+        self.commits = d.get("commits", {})
+
+    def save(self) -> None:
+        _atomic_write_json(self.path, {"indexes": self.indexes, "etags": self.etags,
+                                       "commits": self.commits})
+
+    def clear(self) -> None:
+        self.indexes, self.etags, self.commits = {}, {}, {}
+        self.path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- vault
@@ -162,6 +196,8 @@ class Vault:
         self.prefix = (cfg.get("prefix") or "").strip("/")
         self.user = cfg.get("user") or getpass.getuser()
         self.cache = cache
+        ident = f"{cfg.get('endpoint_url', '')}|{self.bucket}|{self.prefix}"
+        self.hist = HistoryCache(HISTORY_DIR / (hashlib.sha1(ident.encode()).hexdigest()[:16] + ".json"))
         self.s3 = boto3.client(
             "s3",
             endpoint_url=cfg.get("endpoint_url") or None,
@@ -187,12 +223,18 @@ class Vault:
     def _index_key(self, rel: str) -> str:
         return self._key("index", rel + ".json")
 
+    def _current_key(self, rel: str) -> str:
+        return self._key("current", rel)
+
     def rel(self, path) -> str:
         p = Path(path).resolve()
         try:
-            return p.relative_to(self.root).as_posix()
+            rel = p.relative_to(self.root).as_posix()
         except ValueError:
-            raise VaultError(f"This file is outside the vault folder:\n{p}\n\nVault folder: {self.root}")
+            raise VaultError(f"This is outside the vault folder:\n{p}\n\nVault folder: {self.root}")
+        if rel in ("", "."):
+            raise VaultError("That is the vault folder itself.")
+        return rel
 
     def local(self, rel: str) -> Path:
         return self.root / Path(rel)
@@ -202,19 +244,25 @@ class Vault:
     def _missing(err: ClientError) -> bool:
         return err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound")
 
-    def _get_json(self, key: str):
+    def _get_json_etag(self, key: str):
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
             if self._missing(e):
-                return None
+                return None, None
             raise
-        return json.loads(obj["Body"].read())
+        return json.loads(obj["Body"].read()), obj.get("ETag")
+
+    def _get_json(self, key: str):
+        return self._get_json_etag(key)[0]
 
     def _put_json(self, key: str, data) -> None:
         self.s3.put_object(Bucket=self.bucket, Key=key,
                            Body=json.dumps(data, indent=2).encode("utf-8"),
                            ContentType="application/json")
+
+    def _delete(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
 
     def _exists(self, key: str) -> bool:
         try:
@@ -225,33 +273,62 @@ class Vault:
                 return False
             raise
 
-    def _list_keys(self, prefix: str):
+    def _list_objects(self, prefix: str):
         pager = self.s3.get_paginator("list_objects_v2")
         for page in pager.paginate(Bucket=self.bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                yield obj["Key"]
+            yield from page.get("Contents", [])
 
     def test_connection(self) -> None:
         self.s3.head_bucket(Bucket=self.bucket)
 
-    # ---- reading history
+    # ---- history (cached locally)
     def get_index(self, rel: str):
+        """Always reads from the bucket (used before writing)."""
         return self._get_json(self._index_key(rel))
 
-    def list_tracked(self) -> list[str]:
-        pfx = self._key("index") + "/"
-        rels = [k[len(pfx):-5] for k in self._list_keys(pfx) if k.endswith(".json")]
-        return sorted(rels, key=str.lower)
+    def sync(self, progress=lambda msg: None) -> None:
+        """Brings the local history cache up to date. Only changed records are downloaded:
+        index files are compared by ETag, commit records never change once written."""
+        h = self.hist
+        progress("Checking for changes")
+        ipfx = self._key("index") + "/"
+        remote = {o["Key"][len(ipfx):-5]: o.get("ETag")
+                  for o in self._list_objects(ipfx) if o["Key"].endswith(".json")}
+        for rel in [r for r in h.indexes if r not in remote]:
+            h.indexes.pop(rel, None)
+            h.etags.pop(rel, None)
+        changed = [r for r, etag in remote.items() if r not in h.indexes or h.etags.get(r) != etag]
+        if changed:
+            progress(f"Downloading history for {len(changed)} file(s)")
+            with ThreadPoolExecutor(8) as pool:
+                results = pool.map(lambda r: self._get_json_etag(self._index_key(r)), changed)
+                for rel, (data, etag) in zip(changed, results):
+                    if data is None:
+                        h.indexes.pop(rel, None)
+                        h.etags.pop(rel, None)
+                    else:
+                        h.indexes[rel] = data
+                        h.etags[rel] = etag
 
-    def load_indexes(self, rels) -> dict:
-        with ThreadPoolExecutor(8) as pool:
-            return dict(zip(rels, pool.map(self.get_index, rels)))
+        cpfx = self._key("commits") + "/"
+        ids = [o["Key"][len(cpfx):-5] for o in self._list_objects(cpfx) if o["Key"].endswith(".json")]
+        new = [i for i in ids if i not in h.commits]
+        if new:
+            progress(f"Downloading {len(new)} log entries")
+            with ThreadPoolExecutor(8) as pool:
+                for cid, data in zip(new, pool.map(lambda i: self._get_json(self._key("commits", i + ".json")), new)):
+                    if data:
+                        h.commits[cid] = data
+        h.save()
 
-    def list_commits(self) -> list[dict]:
-        keys = [k for k in self._list_keys(self._key("commits") + "/") if k.endswith(".json")]
-        with ThreadPoolExecutor(8) as pool:
-            commits = [c for c in pool.map(self._get_json, keys) if c]
-        return sorted(commits, key=lambda c: c["id"], reverse=True)
+    def tracked(self) -> list[str]:
+        return sorted(self.hist.indexes, key=str.lower)
+
+    def commits(self) -> list[dict]:
+        return sorted(self.hist.commits.values(), key=lambda c: c["id"], reverse=True)
+
+    def clear_history_cache(self) -> None:
+        self.hist.clear()
 
     # ---- local status
     def status(self, rel: str, index) -> tuple[str, str | None]:
@@ -274,26 +351,37 @@ class Vault:
 
     def scan(self, progress=lambda msg: None) -> list[dict]:
         """All tracked files plus untracked files found in the local folder."""
-        progress("Reading file list")
-        tracked = self.list_tracked()
-        indexes = self.load_indexes(tracked)
+        self.sync(progress)
         rows = []
+        tracked = self.tracked()
         for i, rel in enumerate(tracked, 1):
+            index = self.hist.indexes[rel]
             progress(f"Checking {rel} ({i}/{len(tracked)})")
-            st, sha = self.status(rel, indexes[rel])
-            rows.append({"path": rel, "status": st, "sha": sha, "index": indexes[rel]})
+            st, sha = self.status(rel, index)
+            try:
+                size = self.local(rel).stat().st_size
+            except OSError:
+                versions = index.get("versions") or []
+                size = versions[-1]["size"] if versions else None
+            rows.append({"path": rel, "status": st, "sha": sha, "index": index, "size": size})
         known = {r.lower() for r in tracked}
+        progress("Looking for new files")
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for name in filenames:
                 if is_ignored(name) or name.startswith("."):
                     continue
-                rel = Path(dirpath, name).relative_to(self.root).as_posix()
+                full = Path(dirpath, name)
+                rel = full.relative_to(self.root).as_posix()
                 if rel.lower() not in known:
-                    rows.append({"path": rel, "status": "untracked", "sha": None, "index": None})
+                    try:
+                        size = full.stat().st_size
+                    except OSError:
+                        size = None
+                    rows.append({"path": rel, "status": "untracked", "sha": None, "index": None, "size": size})
         return sorted(rows, key=lambda r: r["path"].lower())
 
-    # ---- writing
+    # ---- check in
     def check_in(self, paths, comment: str, progress=lambda msg: None):
         """Creates one commit containing a new version of each changed file.
         Returns (commit or None, list of unchanged rel paths that were skipped)."""
@@ -319,8 +407,7 @@ class Vault:
         if not items:
             return None, skipped
 
-        now = utc_stamp()
-        commit_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:6]
+        now, commit_id = utc_stamp(), new_commit_id()
         files = []
         for i, (p, rel, sha, index) in enumerate(items, 1):
             progress(f"Uploading {rel} ({i}/{len(items)})")
@@ -329,12 +416,12 @@ class Vault:
                 self.s3.upload_file(str(p), self.bucket, blob)
                 # If the file was saved again mid-upload, the blob won't match its name.
                 if self.cache.sha256(p) != sha:
-                    self.s3.delete_object(Bucket=self.bucket, Key=blob)
+                    self._delete(blob)
                     raise VaultError(f"{rel} changed while it was uploading. Check in again.")
             files.append({"path": rel, "version": len(index["versions"]) + 1,
                           "sha256": sha, "size": p.stat().st_size})
 
-        commit = {"id": commit_id, "time": now, "user": self.user,
+        commit = {"id": commit_id, "action": "checkin", "time": now, "user": self.user,
                   "host": socket.gethostname(), "comment": comment, "files": files}
         progress("Writing history")
         self._put_json(self._key("commits", commit_id + ".json"), commit)
@@ -347,28 +434,155 @@ class Vault:
             self._update_current(rel, sha)
         return commit, skipped
 
+    # ---- untrack
+    def untrack(self, rels, comment: str, delete_local=False, progress=lambda msg: None):
+        """Stops tracking files. Their history is archived in the bucket, never deleted.
+        Returns (commit or None, list of local-delete errors)."""
+        comment = (comment or "").strip()
+        if not comment:
+            raise VaultError("A comment is required.")
+        now, commit_id = utc_stamp(), new_commit_id()
+        items = []
+        for rel in rels:
+            progress(f"Archiving history of {rel}")
+            index = self.get_index(rel)
+            if not index:
+                continue
+            self._put_json(self._key("archive", f"{rel}.{commit_id}.json"), index)
+            versions = index.get("versions") or []
+            items.append({"path": rel, "version": versions[-1]["version"] if versions else 0})
+        if not items:
+            return None, []
+        commit = {"id": commit_id, "action": "untrack", "time": now, "user": self.user,
+                  "host": socket.gethostname(), "comment": comment, "files": items}
+        self._put_json(self._key("commits", commit_id + ".json"), commit)
+        errors = []
+        for f in items:
+            rel = f["path"]
+            progress(f"Untracking {rel}")
+            self._delete(self._index_key(rel))
+            self._delete(self._current_key(rel))
+            if delete_local:
+                try:
+                    self.local(rel).unlink(missing_ok=True)
+                except OSError as e:
+                    errors.append(f"{rel}: {e}")
+        return commit, errors
+
+    # ---- rename / move
+    def rename(self, pairs, comment: str, progress=lambda msg: None):
+        """Renames or moves tracked files, keeping their history.
+        pairs: [(old_rel, new_rel), ...]. For each file:
+          - old exists locally, new doesn't: the local file is moved too;
+          - old is gone, new exists (already renamed, e.g. in SOLIDWORKS): history is linked to it.
+        Returns the commit."""
+        comment = (comment or "").strip()
+        if not comment:
+            raise VaultError("A comment is required.")
+        plan = []
+        for old, new in pairs:
+            if old == new:
+                continue
+            index = self.get_index(old)
+            if not index:
+                raise VaultError(f"{old} is not tracked.")
+            if self.get_index(new):
+                raise VaultError(f"{new} is already tracked.")
+            o, n = self.local(old), self.local(new)
+            o_exists, n_exists = o.exists(), n.exists()
+            same_file = o_exists and n_exists and os.path.samefile(o, n)  # case-only rename
+            if o_exists and n_exists and not same_file:
+                raise VaultError(f"Both of these exist locally, so I can't tell which is which:\n{old}\n{new}")
+            if not o_exists and not n_exists:
+                raise VaultError(f"Neither of these exists locally:\n{old}\n{new}")
+            plan.append((old, new, index, o_exists))
+        if not plan:
+            raise VaultError("Nothing to rename.")
+
+        # Move local files first (the step most likely to fail, e.g. file open in SOLIDWORKS).
+        moved = []
+        try:
+            for old, new, _, move in plan:
+                if move:
+                    progress(f"Moving {old}")
+                    self.local(new).parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(self.local(old), self.local(new))
+                    moved.append((old, new))
+        except OSError as e:
+            for old, new in reversed(moved):
+                try:
+                    os.rename(self.local(new), self.local(old))
+                except OSError:
+                    pass
+            raise VaultError(f"Couldn't move a local file:\n{e}\n\nIs it open in SOLIDWORKS or another program?")
+
+        now, commit_id = utc_stamp(), new_commit_id()
+        files = []
+        for old, new, index, _ in plan:
+            progress(f"Moving history {old} → {new}")
+            index["path"] = new
+            index.setdefault("renames", []).append({"from": old, "to": new, "time": now, "commit": commit_id})
+            self._put_json(self._index_key(new), index)
+            versions = index.get("versions") or []
+            files.append({"path": new, "from": old, "version": versions[-1]["version"] if versions else 0})
+        commit = {"id": commit_id, "action": "rename", "time": now, "user": self.user,
+                  "host": socket.gethostname(), "comment": comment, "files": files}
+        self._put_json(self._key("commits", commit_id + ".json"), commit)
+        for old, new, index, _ in plan:
+            self._delete(self._index_key(old))
+            versions = index.get("versions") or []
+            if versions:
+                self._update_current(new, versions[-1]["sha256"])
+            self._delete(self._current_key(old))
+        return commit
+
+    def rename_folder(self, old_dir: str, new_dir: str, comment: str, progress=lambda msg: None):
+        """Moves a whole local folder (including untracked files) and the history of
+        every tracked file inside it."""
+        old_dir, new_dir = old_dir.strip("/"), new_dir.strip("/")
+        if not old_dir or not new_dir or old_dir == new_dir:
+            raise VaultError("Nothing to rename.")
+        if (new_dir + "/").lower().startswith(old_dir.lower() + "/"):
+            raise VaultError("A folder can't be moved inside itself.")
+        o, n = self.local(old_dir), self.local(new_dir)
+        same = o.exists() and n.exists() and os.path.samefile(o, n)
+        if o.exists() and (not n.exists() or same):
+            progress(f"Moving folder {old_dir}")
+            n.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.rename(o, n)
+            except OSError as e:
+                raise VaultError(f"Couldn't move the folder:\n{e}\n\nIs a file in it open in another program?")
+        elif o.exists() and n.exists():
+            raise VaultError(f"A folder named {new_dir} already exists.")
+        elif not n.exists():
+            raise VaultError(f"Neither folder exists locally:\n{old_dir}\n{new_dir}")
+        self.sync(progress)
+        pfx = old_dir + "/"
+        pairs = [(r, new_dir + "/" + r[len(pfx):]) for r in self.tracked() if r.startswith(pfx)]
+        if not pairs:
+            return None
+        return self.rename(pairs, comment, progress)
+
+    # ---- current/ mirror
     def _update_current(self, rel: str, sha: str) -> None:
         """Server-side copy of a blob to current/<real path> (no re-upload).
-        Uses a single CopyObject request (works up to 5 GB) rather than boto3's
-        managed multipart copy, whose UploadPartCopy handling fails on Garage."""
-        self.s3.copy_object(Bucket=self.bucket, Key=self._key("current", rel),
+        A single CopyObject request works up to 5 GB."""
+        self.s3.copy_object(Bucket=self.bucket, Key=self._current_key(rel),
                             CopySource={"Bucket": self.bucket, "Key": self._key("blobs", sha)})
 
     def rebuild_current(self, progress=lambda msg: None) -> int:
-        """Re-creates current/ from the version history (e.g. for files checked in
-        before this feature existed). Returns the number of files written."""
-        progress("Reading file list")
-        tracked = self.list_tracked()
-        indexes = self.load_indexes(tracked)
+        self.sync(progress)
         n = 0
-        for rel in tracked:
-            index = indexes[rel]
-            if index and index.get("versions"):
+        for rel in self.tracked():
+            versions = self.hist.indexes[rel].get("versions") or []
+            if versions:
                 progress(f"Updating current/{rel}")
-                self._update_current(rel, index["versions"][-1]["sha256"])
+                self._update_current(rel, versions[-1]["sha256"])
                 n += 1
         return n
 
+    # ---- restore / get latest
     def restore(self, rel: str, version: dict, dest=None, progress=lambda msg: None) -> Path:
         """Downloads a version to dest (default: its place in the working folder)."""
         dest = Path(dest) if dest else self.local(rel)
@@ -389,13 +603,11 @@ class Vault:
     def get_latest(self, progress=lambda msg: None):
         """Downloads the latest version of tracked files that are missing or older.
         Files with uncommitted local changes are left alone."""
-        progress("Reading file list")
-        tracked = self.list_tracked()
-        indexes = self.load_indexes(tracked)
+        self.sync(progress)
         updated, conflicts, errors = [], [], []
-        for rel in tracked:
-            index = indexes[rel]
-            if not index or not index.get("versions"):
+        for rel in self.tracked():
+            index = self.hist.indexes[rel]
+            if not index.get("versions"):
                 continue
             st, _ = self.status(rel, index)
             if st == "modified":
