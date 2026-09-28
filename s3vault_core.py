@@ -13,7 +13,7 @@ versioning. A local cache of the history means a refresh only downloads what cha
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.3"
 APP_URL = "https://s3pdm.com"
 
 import getpass
@@ -204,10 +204,20 @@ class S3Storage:
         if not cfg.get("bucket"):
             raise VaultError("No bucket configured. Open Settings.")
         self.bucket = cfg["bucket"]
-        self.ident = f"s3|{cfg.get('endpoint_url', '')}|{self.bucket}"
-        self.s3 = boto3.client(
+        endpoint = (cfg.get("endpoint_url") or "").strip().rstrip("/")
+        if endpoint and "://" not in endpoint:
+            endpoint = "https://" + endpoint          # "s3.us-west-001.backblazeb2.com" is fine too
+        self.ident = f"s3|{endpoint}|{self.bucket}"
+        try:
+            self.s3 = self._make_client(cfg, endpoint)
+        except Exception as e:  # noqa: BLE001 - e.g. a malformed endpoint URL
+            raise VaultError(f"The S3 settings aren't valid:\n{e}\n\nCheck the endpoint URL and region in Settings.")
+
+    @staticmethod
+    def _make_client(cfg, endpoint):
+        return boto3.client(
             "s3",
-            endpoint_url=cfg.get("endpoint_url") or None,
+            endpoint_url=endpoint or None,
             region_name=cfg.get("region") or None,
             aws_access_key_id=cfg.get("access_key") or None,
             aws_secret_access_key=cfg.get("secret_key") or None,

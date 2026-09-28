@@ -4,6 +4,35 @@ All notable changes to S3 Vault. Versions follow [Semantic Versioning](https://s
 MAJOR for changes that break compatibility with existing vaults or settings, MINOR for new
 features, PATCH for fixes.
 
+## [1.0.3] – 2026-09-28
+
+### Fixed
+- Switching to a profile whose S3 endpoint had no `https://` failed silently: the new settings
+  were loaded but the previous profile stayed connected, so its files kept showing. Endpoints
+  without a scheme now get `https://` added automatically.
+- If a profile can't be connected, no vault stays connected (previously the old one did), the
+  title shows the profile name and a clear error explains what's wrong.
+- Unexpected errors in any button, menu or event handler are now shown and written to
+  `error.log` instead of disappearing silently when running with `pythonw` or as a packaged app.
+
+## [1.0.2] – 2026-09-28
+
+### Fixed
+- Choosing a profile from the toolbar dropdown could be ignored on some platforms, leaving the
+  previous profile's files on screen. The switch now follows the dropdown's value directly.
+
+### Added
+- About shows the active profile, the local folder in use and the storage location.
+
+## [1.0.1] – 2026-09-28
+
+### Fixed
+- After switching profiles (or saving Settings), the file list could show the previous profile's
+  files: an auto-refresh started for the old profile finished after the switch. Results from a
+  previous profile are now discarded, and a refresh requested while another task is running is
+  queued instead of dropped.
+- Switching profile or opening Settings no longer has to wait for a refresh to finish.
+
 ## [1.0.0] – 2026-09-28
 
 First versioned release.

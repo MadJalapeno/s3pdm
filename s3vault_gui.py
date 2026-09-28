@@ -68,6 +68,9 @@ class App(tk.Tk):
         self.commits = []
         self.q = queue.Queue()
         self.busy = False
+        self.busy_label = ""
+        self.generation = 0          # bumped on every profile connect; stale results are discarded
+        self.pending_refresh = False
         self.show_untracked = tk.BooleanVar(value=True)
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -110,7 +113,9 @@ class App(tk.Tk):
         self.profile_var = tk.StringVar()
         self.profile_combo = ttk.Combobox(bar, textvariable=self.profile_var, state="readonly", width=22)
         self.profile_combo.pack(side="right", padx=(0, 12))
-        self.profile_combo.bind("<<ComboboxSelected>>", self._switch_profile)
+        # Watch the variable itself rather than relying on <<ComboboxSelected>>,
+        # which isn't delivered reliably on every platform / Tk build.
+        self.profile_var.trace_add("write", lambda *_: self.after_idle(self._switch_profile))
         ttk.Label(bar, text="Profile:").pack(side="right", padx=(0, 4))
         self._update_profile_combo()
 
@@ -191,6 +196,8 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, "Please wait for the current operation to finish.", parent=self)
             return
         self.busy = True
+        self.busy_label = label
+        gen = self.generation
         self.status_var.set(label + "…")
         self.pb.pack(side="right")
         self.pb.start(12)
@@ -198,8 +205,8 @@ class App(tk.Tk):
 
         def worker():
             try:
-                res = fn(lambda msg: self.q.put(("status", msg)))
-                self.q.put(("done", on_done, res, None))
+                res = fn(lambda msg: self.q.put(("status", msg, gen)))
+                self.q.put(("done", on_done, res, None, gen))
             except Exception as e:  # noqa: BLE001 - shown to the user
                 try:
                     ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +217,7 @@ class App(tk.Tk):
                     pass
                 if not isinstance(e, VaultError):
                     e = Exception(f"{type(e).__name__}: {e}\n\nDetails were written to:\n{ERROR_LOG}")
-                self.q.put(("done", on_done, None, e))
+                self.q.put(("done", on_done, None, e, gen))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -219,19 +226,27 @@ class App(tk.Tk):
             while True:
                 item = self.q.get_nowait()
                 if item[0] == "status":
-                    self.status_var.set(item[1])
+                    if item[2] == self.generation:
+                        self.status_var.set(item[1])
                     continue
-                _, cb, res, err = item
+                _, cb, res, err, gen = item
                 self.busy = False
+                self.busy_label = ""
                 self.pb.stop()
                 self.pb.pack_forget()
                 self.config(cursor="")
                 self.cache.save()
-                if err:
+                if gen != self.generation:
+                    # Finished after a profile switch: belongs to the old profile, so discard it.
+                    self.pending_refresh = True
+                elif err:
                     self.status_var.set("Error")
                     messagebox.showerror(APP_NAME, str(err), parent=self)
                 else:
                     cb(res)
+                if self.pending_refresh and not self.busy:
+                    self.pending_refresh = False
+                    self.refresh()
         except queue.Empty:
             pass
         self.after(100, self._poll)
@@ -245,12 +260,17 @@ class App(tk.Tk):
 
     def _connect(self, quiet=False):
         name = self.profiles["active"]
+        self.generation += 1
+        self.vault = None                 # never leave the previous profile connected
         self._clear_view()
         try:
             self.vault = Vault(self.cfg, self.cache)
             self.title(f"{APP_NAME} — {name} — {self.vault.root}")
             return True
-        except VaultError as e:
+        except Exception as e:  # noqa: BLE001
+            if not isinstance(e, VaultError):
+                self._log_error(f"Connecting profile {name}")
+                e = f"{type(e).__name__}: {e}"
             self.vault = None
             self.title(f"{APP_NAME} — {name}")
             self.status_var.set("Not connected")
@@ -274,7 +294,7 @@ class App(tk.Tk):
         name = self.profile_var.get()
         if name == self.profiles["active"]:
             return
-        if self.busy:
+        if self.busy and self.busy_label != "Refreshing":
             self.profile_var.set(self.profiles["active"])
             messagebox.showinfo(APP_NAME, "Please wait for the current operation to finish.", parent=self)
             return
@@ -303,7 +323,10 @@ class App(tk.Tk):
             self.refresh()
 
     def refresh(self):
-        if not self.vault or self.busy:
+        if not self.vault:
+            return
+        if self.busy:
+            self.pending_refresh = True   # run it as soon as the current task finishes
             return
         self.last_refresh = time.monotonic()
         v = self.vault
@@ -641,7 +664,7 @@ class App(tk.Tk):
             reveal_path(p)
 
     def open_settings(self):
-        if self.busy:
+        if self.busy and self.busy_label != "Refreshing":
             messagebox.showinfo(APP_NAME, "Please wait for the current operation to finish.", parent=self)
             return
         dlg = SettingsDialog(self, self.profiles)
@@ -653,6 +676,28 @@ class App(tk.Tk):
             self._update_profile_combo()
             if self._connect():
                 self.refresh()
+
+    def _log_error(self, label):
+        try:
+            ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S}  {label}\n")
+                f.write(traceback.format_exc())
+        except OSError:
+            pass
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk calls this for errors in button/menu/event handlers. Without it they vanish
+        silently under pythonw or a packaged app."""
+        try:
+            ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S}  UI callback\n")
+                f.write("".join(traceback.format_exception(exc, val, tb)))
+        except OSError:
+            pass
+        messagebox.showerror(APP_NAME, f"Unexpected error: {exc.__name__}: {val}\n\n"
+                                       f"Details were written to:\n{ERROR_LOG}", parent=self)
 
     def show_about(self):
         AboutDialog(self)
@@ -683,6 +728,16 @@ class AboutDialog(tk.Toplevel):
                          cursor="hand2", font=link_font)
         link.pack(pady=(10, 12))
         link.bind("<Button-1>", lambda e: webbrowser.open(APP_URL))
+        cfg = parent.cfg
+        if cfg.get("backend") == "folder":
+            storage = f"Folder: {cfg.get('storage_path', '')}"
+        else:
+            storage = f"S3: {cfg.get('endpoint_url') or 'AWS'} / {cfg.get('bucket', '')}"
+        if cfg.get("prefix"):
+            storage += f" / {cfg['prefix']}"
+        in_use = parent.vault.root if parent.vault else "(not connected)"
+        ttk.Label(frm, text=f"Profile: {parent.profiles['active']}\nLocal folder: {in_use}\n{storage}",
+                  justify="center").pack(pady=(0, 10))
         details = (f"Python {sys.version.split()[0]} · Tk {self.tk.call('info', 'patchlevel')}\n"
                    f"Settings: {CONFIG_DIR}")
         ttk.Label(frm, text=details, foreground="#777", justify="center").pack()
