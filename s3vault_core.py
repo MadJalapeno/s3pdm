@@ -13,10 +13,14 @@ versioning. A local cache of the history means a refresh only downloads what cha
 """
 from __future__ import annotations
 
+__version__ = "1.0.0"
+APP_URL = "https://s3pdm.com"
+
 import getpass
 import hashlib
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -46,6 +50,8 @@ IGNORED_SUFFIXES = (".s3vault-tmp",)
 IGNORED_NAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
 
 DEFAULT_CONFIG = {
+    "backend": "s3",          # "s3" or "folder"
+    "storage_path": "",       # folder backend: network drive / NAS / USB / synced folder
     "endpoint_url": "",
     "region": "",
     "bucket": "",
@@ -63,18 +69,26 @@ class VaultError(Exception):
 
 # ---------------------------------------------------------------- helpers
 
-def load_config() -> dict:
-    cfg = dict(DEFAULT_CONFIG)
+def load_profiles() -> dict:
+    """Returns {"active": name, "profiles": {name: settings}}.
+    An old single-settings config.json is converted into a profile called "Default"."""
     try:
-        cfg.update(json.loads(CONFIG_FILE.read_text("utf-8")))
+        raw = json.loads(CONFIG_FILE.read_text("utf-8"))
     except (FileNotFoundError, ValueError):
-        pass
-    return cfg
+        raw = {}
+    if "profiles" not in raw:
+        old = dict(DEFAULT_CONFIG)
+        old.update(raw)
+        raw = {"active": "Default", "profiles": {"Default": old}}
+    profiles = {name: {**DEFAULT_CONFIG, **cfg} for name, cfg in raw["profiles"].items()} \
+        or {"Default": dict(DEFAULT_CONFIG)}
+    active = raw.get("active") if raw.get("active") in profiles else sorted(profiles)[0]
+    return {"active": active, "profiles": profiles}
 
 
-def save_config(cfg: dict) -> None:
+def save_profiles(data: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), "utf-8")
+    CONFIG_FILE.write_text(json.dumps(data, indent=2), "utf-8")
 
 
 def _atomic_write_json(path: Path, data) -> None:
@@ -183,21 +197,14 @@ class HistoryCache:
 
 # ---------------------------------------------------------------- vault
 
-class Vault:
-    def __init__(self, cfg: dict, cache: HashCache):
+class S3Storage:
+    """S3-compatible object storage (Backblaze B2, Garage, Wasabi, AWS …)."""
+
+    def __init__(self, cfg: dict):
         if not cfg.get("bucket"):
             raise VaultError("No bucket configured. Open Settings.")
-        if not cfg.get("local_root"):
-            raise VaultError("No local vault folder configured. Open Settings.")
-        self.root = Path(cfg["local_root"]).expanduser().resolve()
-        if not self.root.is_dir():
-            raise VaultError(f"Local vault folder does not exist:\n{self.root}")
         self.bucket = cfg["bucket"]
-        self.prefix = (cfg.get("prefix") or "").strip("/")
-        self.user = cfg.get("user") or getpass.getuser()
-        self.cache = cache
-        ident = f"{cfg.get('endpoint_url', '')}|{self.bucket}|{self.prefix}"
-        self.hist = HistoryCache(HISTORY_DIR / (hashlib.sha1(ident.encode()).hexdigest()[:16] + ".json"))
+        self.ident = f"s3|{cfg.get('endpoint_url', '')}|{self.bucket}"
         self.s3 = boto3.client(
             "s3",
             endpoint_url=cfg.get("endpoint_url") or None,
@@ -215,6 +222,167 @@ class Vault:
                 response_checksum_validation="when_required",
             ),
         )
+
+    @staticmethod
+    def _missing(err: ClientError) -> bool:
+        return err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound")
+
+    def get(self, key):
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if self._missing(e):
+                return None, None
+            raise
+        return obj["Body"].read(), obj.get("ETag")
+
+    def put(self, key, data: bytes):
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=data)
+
+    def delete(self, key):
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def exists(self, key) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError as e:
+            if self._missing(e):
+                return False
+            raise
+
+    def list(self, prefix):
+        """Yields (key, etag) for every object under prefix."""
+        pager = self.s3.get_paginator("list_objects_v2")
+        for page in pager.paginate(Bucket=self.bucket, Prefix=prefix):
+            for o in page.get("Contents", []):
+                yield o["Key"], o.get("ETag")
+
+    def upload_file(self, path, key):
+        self.s3.upload_file(str(path), self.bucket, key)
+
+    def download_file(self, key, path):
+        self.s3.download_file(self.bucket, key, str(path))
+
+    def copy(self, src_key, dst_key):
+        # Single server-side CopyObject request (works up to 5 GB).
+        self.s3.copy_object(Bucket=self.bucket, Key=dst_key,
+                            CopySource={"Bucket": self.bucket, "Key": src_key})
+
+    def test(self):
+        self.s3.head_bucket(Bucket=self.bucket)
+
+
+class FolderStorage:
+    """Stores the vault in an ordinary folder: a network drive, NAS share, USB drive,
+    or a folder that a sync client (Sync.com, Box Drive, OneDrive …) uploads."""
+
+    def __init__(self, cfg: dict):
+        path = (cfg.get("storage_path") or "").strip()
+        if not path:
+            raise VaultError("No storage folder configured. Open Settings.")
+        self.base = Path(path).expanduser()
+        if not self.base.is_dir():
+            raise VaultError(f"The storage folder isn't available:\n{self.base}\n\n"
+                             "Is the network drive connected?")
+        self.ident = f"folder|{self.base.resolve()}"
+
+    def _path(self, key) -> Path:
+        return self.base.joinpath(*key.split("/"))
+
+    @staticmethod
+    def _etag(st) -> str:
+        return f"{st.st_size}-{st.st_mtime_ns}"
+
+    def _write_atomic(self, dest: Path, writer):
+        """Write to a temporary file first, so a dropped connection never leaves a half-written file."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex[:8]}.part")
+        try:
+            writer(tmp)
+            os.replace(tmp, dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def get(self, key):
+        p = self._path(key)
+        try:
+            data = p.read_bytes()
+            st = p.stat()
+        except FileNotFoundError:
+            return None, None
+        return data, self._etag(st)
+
+    def put(self, key, data: bytes):
+        self._write_atomic(self._path(key), lambda t: t.write_bytes(data))
+
+    def delete(self, key):
+        p = self._path(key)
+        p.unlink(missing_ok=True)
+        parent = p.parent          # tidy up folders left empty
+        while parent != self.base and self.base in parent.parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def exists(self, key) -> bool:
+        return self._path(key).is_file()
+
+    def list(self, prefix):
+        folder = self._path(prefix.rstrip("/")) if prefix.strip("/") else self.base
+        if not folder.is_dir():
+            return
+        for dirpath, _, files in os.walk(folder):
+            for name in files:
+                if name.endswith(".part"):
+                    continue
+                full = Path(dirpath, name)
+                try:
+                    st = full.stat()
+                except FileNotFoundError:
+                    continue
+                yield full.relative_to(self.base).as_posix(), self._etag(st)
+
+    def upload_file(self, path, key):
+        self._write_atomic(self._path(key), lambda t: shutil.copyfile(path, t))
+
+    def download_file(self, key, path):
+        shutil.copyfile(self._path(key), path)
+
+    def copy(self, src_key, dst_key):
+        self._write_atomic(self._path(dst_key), lambda t: shutil.copyfile(self._path(src_key), t))
+
+    def test(self):
+        probe = self.base / f".s3vault-probe-{uuid.uuid4().hex[:8]}"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+
+
+def make_storage(cfg: dict):
+    return FolderStorage(cfg) if cfg.get("backend") == "folder" else S3Storage(cfg)
+
+
+class Vault:
+    def __init__(self, cfg: dict, cache: HashCache):
+        if not cfg.get("local_root"):
+            raise VaultError("No local vault folder configured. Open Settings.")
+        self.root = Path(cfg["local_root"]).expanduser().resolve()
+        if not self.root.is_dir():
+            raise VaultError(f"Local vault folder does not exist:\n{self.root}")
+        self.store = make_storage(cfg)
+        if isinstance(self.store, FolderStorage):
+            b = self.store.base.resolve()
+            if b == self.root or self.root in b.parents or b in self.root.parents:
+                raise VaultError("The storage folder and the local vault folder must be separate "
+                                 "(neither inside the other).")
+        self.prefix = (cfg.get("prefix") or "").strip("/")
+        self.user = cfg.get("user") or getpass.getuser()
+        self.cache = cache
+        ident = f"{self.store.ident}|{self.prefix}"
+        self.hist = HistoryCache(HISTORY_DIR / (hashlib.sha1(ident.encode()).hexdigest()[:16] + ".json"))
 
     # ---- keys / paths
     def _key(self, *parts: str) -> str:
@@ -239,47 +407,25 @@ class Vault:
     def local(self, rel: str) -> Path:
         return self.root / Path(rel)
 
-    # ---- S3 primitives
-    @staticmethod
-    def _missing(err: ClientError) -> bool:
-        return err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound")
-
+    # ---- storage primitives
     def _get_json_etag(self, key: str):
-        try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        except ClientError as e:
-            if self._missing(e):
-                return None, None
-            raise
-        return json.loads(obj["Body"].read()), obj.get("ETag")
+        data, etag = self.store.get(key)
+        return (json.loads(data), etag) if data is not None else (None, None)
 
     def _get_json(self, key: str):
         return self._get_json_etag(key)[0]
 
     def _put_json(self, key: str, data) -> None:
-        self.s3.put_object(Bucket=self.bucket, Key=key,
-                           Body=json.dumps(data, indent=2).encode("utf-8"),
-                           ContentType="application/json")
+        self.store.put(key, json.dumps(data, indent=2).encode("utf-8"))
 
     def _delete(self, key: str) -> None:
-        self.s3.delete_object(Bucket=self.bucket, Key=key)
+        self.store.delete(key)
 
     def _exists(self, key: str) -> bool:
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
-            return True
-        except ClientError as e:
-            if self._missing(e):
-                return False
-            raise
-
-    def _list_objects(self, prefix: str):
-        pager = self.s3.get_paginator("list_objects_v2")
-        for page in pager.paginate(Bucket=self.bucket, Prefix=prefix):
-            yield from page.get("Contents", [])
+        return self.store.exists(key)
 
     def test_connection(self) -> None:
-        self.s3.head_bucket(Bucket=self.bucket)
+        self.store.test()
 
     # ---- history (cached locally)
     def get_index(self, rel: str):
@@ -292,8 +438,7 @@ class Vault:
         h = self.hist
         progress("Checking for changes")
         ipfx = self._key("index") + "/"
-        remote = {o["Key"][len(ipfx):-5]: o.get("ETag")
-                  for o in self._list_objects(ipfx) if o["Key"].endswith(".json")}
+        remote = {k[len(ipfx):-5]: etag for k, etag in self.store.list(ipfx) if k.endswith(".json")}
         for rel in [r for r in h.indexes if r not in remote]:
             h.indexes.pop(rel, None)
             h.etags.pop(rel, None)
@@ -311,7 +456,7 @@ class Vault:
                         h.etags[rel] = etag
 
         cpfx = self._key("commits") + "/"
-        ids = [o["Key"][len(cpfx):-5] for o in self._list_objects(cpfx) if o["Key"].endswith(".json")]
+        ids = [k[len(cpfx):-5] for k, _ in self.store.list(cpfx) if k.endswith(".json")]
         new = [i for i in ids if i not in h.commits]
         if new:
             progress(f"Downloading {len(new)} log entries")
@@ -413,7 +558,7 @@ class Vault:
             progress(f"Uploading {rel} ({i}/{len(items)})")
             blob = self._key("blobs", sha)
             if not self._exists(blob):
-                self.s3.upload_file(str(p), self.bucket, blob)
+                self.store.upload_file(p, blob)
                 # If the file was saved again mid-upload, the blob won't match its name.
                 if self.cache.sha256(p) != sha:
                     self._delete(blob)
@@ -422,7 +567,7 @@ class Vault:
                           "sha256": sha, "size": p.stat().st_size})
 
         commit = {"id": commit_id, "action": "checkin", "time": now, "user": self.user,
-                  "host": socket.gethostname(), "comment": comment, "files": files}
+                  "host": socket.gethostname(), "app_version": __version__, "comment": comment, "files": files}
         progress("Writing history")
         self._put_json(self._key("commits", commit_id + ".json"), commit)
         for (p, rel, sha, index), f in zip(items, files):
@@ -454,7 +599,7 @@ class Vault:
         if not items:
             return None, []
         commit = {"id": commit_id, "action": "untrack", "time": now, "user": self.user,
-                  "host": socket.gethostname(), "comment": comment, "files": items}
+                  "host": socket.gethostname(), "app_version": __version__, "comment": comment, "files": items}
         self._put_json(self._key("commits", commit_id + ".json"), commit)
         errors = []
         for f in items:
@@ -526,7 +671,7 @@ class Vault:
             versions = index.get("versions") or []
             files.append({"path": new, "from": old, "version": versions[-1]["version"] if versions else 0})
         commit = {"id": commit_id, "action": "rename", "time": now, "user": self.user,
-                  "host": socket.gethostname(), "comment": comment, "files": files}
+                  "host": socket.gethostname(), "app_version": __version__, "comment": comment, "files": files}
         self._put_json(self._key("commits", commit_id + ".json"), commit)
         for old, new, index, _ in plan:
             self._delete(self._index_key(old))
@@ -566,10 +711,8 @@ class Vault:
 
     # ---- current/ mirror
     def _update_current(self, rel: str, sha: str) -> None:
-        """Server-side copy of a blob to current/<real path> (no re-upload).
-        A single CopyObject request works up to 5 GB."""
-        self.s3.copy_object(Bucket=self.bucket, Key=self._current_key(rel),
-                            CopySource={"Bucket": self.bucket, "Key": self._key("blobs", sha)})
+        """Copy of a blob to current/<real path> (server-side on S3, no re-upload)."""
+        self.store.copy(self._key("blobs", sha), self._current_key(rel))
 
     def rebuild_current(self, progress=lambda msg: None) -> int:
         self.sync(progress)
@@ -589,7 +732,7 @@ class Vault:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".s3vault-tmp")
         progress(f"Downloading {rel} v{version['version']}")
-        self.s3.download_file(self.bucket, self._key("blobs", version["sha256"]), str(tmp))
+        self.store.download_file(self._key("blobs", version["sha256"]), tmp)
         if sha256_file(tmp) != version["sha256"]:
             tmp.unlink(missing_ok=True)
             raise VaultError(f"Downloaded data for {rel} failed its integrity check.")

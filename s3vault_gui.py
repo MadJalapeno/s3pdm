@@ -11,12 +11,14 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import webbrowser
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+import json
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
-from s3vault_core import (ERROR_LOG, HashCache, Vault, VaultError, human_size, is_ignored,
-                          load_config, local_time, save_config)
+from s3vault_core import (APP_URL, CONFIG_DIR, DEFAULT_CONFIG, __version__, ERROR_LOG, HashCache, Vault, VaultError, human_size,
+                          is_ignored, load_profiles, local_time, save_profiles)
 
 APP_NAME = "S3 Vault"
 STATUS_COLORS = {
@@ -56,7 +58,8 @@ class App(tk.Tk):
         self.title(APP_NAME)
         self.geometry("1150x680")
         self.minsize(850, 450)
-        self.cfg = load_config()
+        self.profiles = load_profiles()
+        self.cfg = self.profiles["profiles"][self.profiles["active"]]
         self.cache = HashCache()
         self.vault = None
         self.rows = {}           # rel path -> row
@@ -70,6 +73,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.last_refresh = 0.0
         self.bind("<Activate>", self._on_activate)
+        if IS_MAC:
+            self.createcommand("tk::mac::ShowAbout", self.show_about)  # app menu → About
         self.after(100, self._poll)
         self.after(150, self._startup)
 
@@ -96,10 +101,18 @@ class App(tk.Tk):
         menu.add_command(label="Recheck All Local Files", command=self.recheck_files)
         menu.add_separator()
         menu.add_command(label="Settings…", command=self.open_settings)
+        menu.add_separator()
+        menu.add_command(label=f"About {APP_NAME}…", command=self.show_about)
         more["menu"] = menu
         more.pack(side="left", padx=(0, 4))
         ttk.Checkbutton(bar, text="Show untracked", variable=self.show_untracked,
                         command=self._fill_files).pack(side="right")
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(bar, textvariable=self.profile_var, state="readonly", width=22)
+        self.profile_combo.pack(side="right", padx=(0, 12))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._switch_profile)
+        ttk.Label(bar, text="Profile:").pack(side="right", padx=(0, 4))
+        self._update_profile_combo()
 
         sb = ttk.Frame(self, padding=(6, 0, 6, 6))
         sb.pack(fill="x", side="bottom")
@@ -231,16 +244,46 @@ class App(tk.Tk):
             self.open_settings()
 
     def _connect(self, quiet=False):
+        name = self.profiles["active"]
+        self._clear_view()
         try:
             self.vault = Vault(self.cfg, self.cache)
-            self.title(f"{APP_NAME} — {self.vault.root}")
-            self.open_dirs = None
+            self.title(f"{APP_NAME} — {name} — {self.vault.root}")
             return True
         except VaultError as e:
             self.vault = None
+            self.title(f"{APP_NAME} — {name}")
+            self.status_var.set("Not connected")
             if not quiet:
                 messagebox.showerror(APP_NAME, str(e), parent=self)
             return False
+
+    def _clear_view(self):
+        """Empty the lists so files from another profile are never shown."""
+        self.rows, self.visible, self.commits = {}, set(), []
+        self.open_dirs = None
+        self.files.delete(*self.files.get_children())
+        self.log.delete(*self.log.get_children())
+        self.logfiles.delete(*self.logfiles.get_children())
+
+    def _update_profile_combo(self):
+        self.profile_combo["values"] = sorted(self.profiles["profiles"], key=str.lower)
+        self.profile_var.set(self.profiles["active"])
+
+    def _switch_profile(self, _event=None):
+        name = self.profile_var.get()
+        if name == self.profiles["active"]:
+            return
+        if self.busy:
+            self.profile_var.set(self.profiles["active"])
+            messagebox.showinfo(APP_NAME, "Please wait for the current operation to finish.", parent=self)
+            return
+        self.cache.save()
+        self.profiles["active"] = name
+        save_profiles(self.profiles)
+        self.cfg = self.profiles["profiles"][name]
+        if self._connect():
+            self.refresh()
 
     def _need_vault(self):
         if self.vault:
@@ -598,17 +641,55 @@ class App(tk.Tk):
             reveal_path(p)
 
     def open_settings(self):
-        dlg = SettingsDialog(self, self.cfg)
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Please wait for the current operation to finish.", parent=self)
+            return
+        dlg = SettingsDialog(self, self.profiles)
         self.wait_window(dlg)
         if dlg.saved:
-            self.cfg = dlg.saved
-            save_config(self.cfg)
+            self.profiles = dlg.saved
+            save_profiles(self.profiles)
+            self.cfg = self.profiles["profiles"][self.profiles["active"]]
+            self._update_profile_combo()
             if self._connect():
                 self.refresh()
+
+    def show_about(self):
+        AboutDialog(self)
 
     def on_close(self):
         self.cache.save()
         self.destroy()
+
+
+class AboutDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title(f"About {APP_NAME}")
+        self.transient(parent)
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=(24, 18))
+        frm.pack(fill="both", expand=True)
+        title_font = tkfont.nametofont("TkDefaultFont").copy()
+        title_font.configure(size=title_font.cget("size") + 6, weight="bold")
+        ttk.Label(frm, text=APP_NAME, font=title_font).pack()
+        ttk.Label(frm, text=f"Version {__version__}").pack(pady=(2, 10))
+        ttk.Label(frm, text="Manual, versioned check-in of design files\n"
+                            "to S3-compatible storage or a network drive.",
+                  justify="center").pack()
+        link_font = tkfont.nametofont("TkDefaultFont").copy()
+        link_font.configure(underline=True)
+        link = ttk.Label(frm, text=APP_URL.replace("https://", ""), foreground="#1f5fbf",
+                         cursor="hand2", font=link_font)
+        link.pack(pady=(10, 12))
+        link.bind("<Button-1>", lambda e: webbrowser.open(APP_URL))
+        details = (f"Python {sys.version.split()[0]} · Tk {self.tk.call('info', 'patchlevel')}\n"
+                   f"Settings: {CONFIG_DIR}")
+        ttk.Label(frm, text=details, foreground="#777", justify="center").pack()
+        ttk.Button(frm, text="Close", command=self.destroy).pack(pady=(14, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.destroy())
+        self.grab_set()
 
 
 class CommentDialog(tk.Toplevel):
@@ -809,65 +890,195 @@ class HistoryWindow(tk.Toplevel):
 
 
 class SettingsDialog(tk.Toplevel):
-    FIELDS = [("endpoint_url", "S3 endpoint URL"),
-              ("region", "Region"),
-              ("bucket", "Bucket"),
-              ("prefix", "Prefix in bucket (optional)"),
-              ("access_key", "Access key ID"),
-              ("secret_key", "Secret access key"),
-              ("local_root", "Local vault folder"),
-              ("user", "Your name (shown in history)")]
+    S3_FIELDS = [("endpoint_url", "S3 endpoint URL"),
+                 ("region", "Region"),
+                 ("bucket", "Bucket"),
+                 ("access_key", "Access key ID"),
+                 ("secret_key", "Secret access key")]
+    FOLDER_FIELDS = [("storage_path", "Storage folder")]
+    COMMON_FIELDS = [("prefix", "Prefix / subfolder (optional)"),
+                     ("local_root", "Local vault folder"),
+                     ("user", "Your name (shown in history)")]
+    HINTS = {
+        "s3": "e.g. Backblaze: endpoint https://s3.us-east-005.backblazeb2.com, region us-east-005",
+        "folder": ("A network drive or NAS share (e.g. " +
+                   ("/Volumes/share/vaults" if IS_MAC else r"\\server\share\vaults") +
+                   "), a USB drive, or a folder synced by Sync.com, Box Drive or OneDrive. "
+                   "It must be separate from the local vault folder."),
+    }
 
-    def __init__(self, parent, cfg):
+    def __init__(self, parent, profiles):
         super().__init__(parent)
         self.title("Settings")
         self.transient(parent)
         self.resizable(True, False)
         self.saved = None
+        self.data = json.loads(json.dumps(profiles))  # work on a copy until Save
+        self.current = self.data["active"]
         self.vars = {}
+        self.rows = {}
+
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
-        for i, (key, label) in enumerate(self.FIELDS):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=3, padx=(0, 8))
-            var = tk.StringVar(value=cfg.get(key, ""))
-            ttk.Entry(frm, textvariable=var, width=52,
-                      show="•" if key == "secret_key" else "").grid(row=i, column=1, sticky="ew", pady=3)
-            self.vars[key] = var
-            if key == "local_root":
-                ttk.Button(frm, text="Browse…", command=self._browse).grid(row=i, column=2, padx=(6, 0))
         frm.columnconfigure(1, weight=1)
-        ttk.Label(frm, text="e.g. Backblaze: endpoint https://s3.us-east-005.backblazeb2.com, "
-                            "region us-east-005", foreground="#777").grid(
-            row=len(self.FIELDS), column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        # profile row
+        ttk.Label(frm, text="Profile").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(frm, textvariable=self.profile_var, state="readonly")
+        self.profile_combo.grid(row=0, column=1, sticky="ew")
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_select)
+        pbtns = ttk.Frame(frm)
+        pbtns.grid(row=1, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        for text, cmd in [("New…", self._new), ("Duplicate…", self._duplicate),
+                          ("Rename…", self._rename), ("Delete", self._delete)]:
+            ttk.Button(pbtns, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        ttk.Separator(frm).grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
+
+        # storage type
+        ttk.Label(frm, text="Storage").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        self.backend_var = tk.StringVar(value="s3")
+        rb = ttk.Frame(frm)
+        rb.grid(row=3, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(rb, text="S3-compatible cloud storage", value="s3", variable=self.backend_var,
+                        command=self._show_backend).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(rb, text="Folder / network drive", value="folder", variable=self.backend_var,
+                        command=self._show_backend).pack(side="left")
+
+        r = 4
+        for key, label in self.S3_FIELDS + self.FOLDER_FIELDS + self.COMMON_FIELDS:
+            lab = ttk.Label(frm, text=label)
+            lab.grid(row=r, column=0, sticky="w", pady=3, padx=(0, 8))
+            var = tk.StringVar()
+            ent = ttk.Entry(frm, textvariable=var, width=56, show="•" if key == "secret_key" else "")
+            ent.grid(row=r, column=1, sticky="ew", pady=3)
+            widgets = [lab, ent]
+            if key in ("local_root", "storage_path"):
+                btn = ttk.Button(frm, text="Browse…", command=lambda k=key: self._browse(k))
+                btn.grid(row=r, column=2, padx=(6, 0))
+                widgets.append(btn)
+            self.vars[key], self.rows[key] = var, widgets
+            r += 1
+        self.hint = ttk.Label(frm, foreground="#777", wraplength=560, justify="left")
+        self.hint.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         btns = ttk.Frame(frm)
-        btns.grid(row=len(self.FIELDS) + 1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        btns.grid(row=r + 1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Test Connection", command=self._test).pack(side="left")
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btns, text="Save", command=self._save).pack(side="right", padx=6)
+
+        self._refresh_profile_list()
+        self._load(self.current)
         self.grab_set()
 
-    def _values(self):
-        return {k: v.get().strip() for k, v in self.vars.items()}
+    # ---- profile data
+    def _refresh_profile_list(self):
+        self.profile_combo["values"] = sorted(self.data["profiles"], key=str.lower)
 
-    def _browse(self):
-        d = filedialog.askdirectory(parent=self, title="Choose the local vault folder",
-                                    initialdir=self.vars["local_root"].get() or None)
+    def _load(self, name):
+        self.current = name
+        cfg = {**DEFAULT_CONFIG, **self.data["profiles"][name]}
+        for key, var in self.vars.items():
+            var.set(cfg.get(key, ""))
+        self.backend_var.set(cfg.get("backend") or "s3")
+        self.profile_var.set(name)
+        self._show_backend()
+
+    def _store(self):
+        cfg = self.data["profiles"][self.current]
+        cfg.update({k: v.get().strip() for k, v in self.vars.items()})
+        cfg["backend"] = self.backend_var.get()
+
+    def _show_backend(self):
+        backend = self.backend_var.get()
+        for key, _ in self.S3_FIELDS:
+            for w in self.rows[key]:
+                w.grid() if backend == "s3" else w.grid_remove()
+        for key, _ in self.FOLDER_FIELDS:
+            for w in self.rows[key]:
+                w.grid() if backend == "folder" else w.grid_remove()
+        self.hint.configure(text=self.HINTS[backend])
+
+    def _ask_name(self, title, initial="", allow_same=False):
+        name = simpledialog.askstring(title, "Profile name:", initialvalue=initial, parent=self)
+        name = (name or "").strip()
+        if not name:
+            return None
+        if name in self.data["profiles"] and not (allow_same and name == initial):
+            messagebox.showerror(title, f"A profile called \"{name}\" already exists.", parent=self)
+            return None
+        return name
+
+    def _on_profile_select(self, _event=None):
+        self._store()
+        self._load(self.profile_var.get())
+
+    def _new(self):
+        name = self._ask_name("New Profile")
+        if name:
+            self._store()
+            self.data["profiles"][name] = dict(DEFAULT_CONFIG)
+            self._refresh_profile_list()
+            self._load(name)
+
+    def _duplicate(self):
+        name = self._ask_name("Duplicate Profile", f"{self.current} copy")
+        if name:
+            self._store()
+            self.data["profiles"][name] = dict(self.data["profiles"][self.current])
+            self._refresh_profile_list()
+            self._load(name)
+
+    def _rename(self):
+        old = self.current
+        name = self._ask_name("Rename Profile", old, allow_same=True)
+        if name and name != old:
+            self._store()
+            self.data["profiles"][name] = self.data["profiles"].pop(old)
+            if self.data["active"] == old:
+                self.data["active"] = name
+            self._refresh_profile_list()
+            self._load(name)
+
+    def _delete(self):
+        if len(self.data["profiles"]) == 1:
+            messagebox.showinfo("Delete Profile", "You can't delete the only profile.", parent=self)
+            return
+        if not messagebox.askyesno("Delete Profile", f"Delete the profile \"{self.current}\"?\n\n"
+                                   "Only the settings are removed. Files in storage and in the local "
+                                   "folder are not touched.", parent=self):
+            return
+        del self.data["profiles"][self.current]
+        if self.data["active"] not in self.data["profiles"]:
+            self.data["active"] = sorted(self.data["profiles"], key=str.lower)[0]
+        self._refresh_profile_list()
+        self._load(sorted(self.data["profiles"], key=str.lower)[0])
+
+    # ---- actions
+    def _browse(self, key):
+        title = "Choose the local vault folder" if key == "local_root" else "Choose the storage folder"
+        d = filedialog.askdirectory(parent=self, title=title, initialdir=self.vars[key].get() or None)
         if d:
-            self.vars["local_root"].set(d)
+            self.vars[key].set(d)
 
     def _test(self):
+        self._store()
         self.config(cursor="watch")
         self.update_idletasks()
         try:
-            Vault(self._values(), HashCache()).test_connection()
-            messagebox.showinfo("Settings", "Connected. The bucket is reachable.", parent=self)
+            Vault(self.data["profiles"][self.current], HashCache()).test_connection()
+            where = "folder is writable" if self.backend_var.get() == "folder" else "bucket is reachable"
+            messagebox.showinfo("Settings", f"Connected. The {where}.", parent=self)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Settings", f"Connection failed:\n\n{e}", parent=self)
         finally:
             self.config(cursor="")
 
     def _save(self):
-        self.saved = self._values()
+        self._store()
+        self.data["active"] = self.current   # the profile shown when saving becomes active
+        self.saved = self.data
         self.destroy()
 
 

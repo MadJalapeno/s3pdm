@@ -1,0 +1,10 @@
+## Versioning and releases
+
+The version number is `__version__` in `s3vault_core.py` and is shown under **More ▾ → About**.
+Every commit record in the vault also stores the app version that wrote it.
+
+To release a new version:
+
+1. Update `__version__` in `s3vault_core.py`.
+2. Add an entry at the top of `CHANGELOG.md`.
+3. Commit and tag it: `git commit -am "Release 1.1.0"` then `git tag v1.1.0` and `git push --tags`.

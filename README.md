@@ -1,6 +1,7 @@
 # S3 Vault
 
-Manual, versioned check-in of files to S3-compatible storage (Backblaze B2, Garage, Wasabi, AWS …).
+Manual, versioned check-in of files to S3-compatible storage (Backblaze B2, Garage, Wasabi, AWS …)
+or to a folder (network drive, NAS, USB drive, or a folder synced by Sync.com / Box Drive / OneDrive).
 Nothing syncs automatically: you pick files, write a comment, and each check-in creates a new version.
 Runs on Windows and macOS.
 
@@ -12,6 +13,27 @@ Runs on Windows and macOS.
 
 Standalone app: `python -m pip install pyinstaller`, then
 `python -m PyInstaller --onefile --windowed --name S3Vault s3vault_gui.py` → `dist/`.
+
+## Profiles
+
+Each profile is a complete set of settings: storage (S3 or folder), prefix, local vault folder and
+your name. Switch profiles with the **Profile** dropdown in the toolbar. In **Settings** you can
+create, duplicate, rename and delete profiles; the profile shown when you click Save becomes active.
+Deleting a profile only removes its settings, never any files.
+
+Existing settings from earlier versions are converted into a profile called "Default".
+
+## Folder / network drive storage
+
+Choose **Folder / network drive** in Settings and pick the storage folder, e.g.
+`\\server\share\vaults` on Windows or `/Volumes/share/vaults` on macOS. The layout inside it is
+identical to the bucket layout. Every write goes to a temporary `.part` file first and is then
+renamed, so a dropped connection never leaves a half-written file.
+
+- The storage folder and the local vault folder must be separate (neither inside the other).
+- Several projects can share one storage folder by giving each profile a different prefix.
+- With a sync-client folder (Sync.com, Box Drive, OneDrive), a check-in is only off your machine
+  once the sync client has finished uploading it.
 
 ## Backblaze setup
 
@@ -39,7 +61,9 @@ The Files tab is a folder tree with sizes and a status for every file. Folders s
   are never overwritten.
 - **Right-click** a file or folder for the same actions, plus Open and Show in Folder.
 - **Log** tab – every check-in, rename and untrack, with the files involved.
-- **More ▾** – open the vault folder, expand/collapse all, rebuild current/, reload history, settings.
+- **More ▾** – open the vault folder, expand/collapse all, rebuild current/, reload history,
+  recheck all local files, settings.
+- The list refreshes automatically when you switch back to the app (at most every 10 seconds).
 
 ## Speed: local history cache
 
@@ -66,3 +90,5 @@ history grows. **More ▾ → Reload History from Bucket** rebuilds the cache fr
 - Lock files (`~$…`), Thumbs.db, desktop.ini and .DS_Store are ignored.
 - The current/ copy uses a single request, which works for files up to 5 GB.
 - Errors are logged to `error.log` in the settings folder.
+
+
